@@ -1,0 +1,10 @@
+{
+  "name": "telegram-vcard-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "dependencies": {
+    "node-telegram-bot-api": "^0.61.0",
+    "googleapis": "^144.0.0"
+  }
+}
