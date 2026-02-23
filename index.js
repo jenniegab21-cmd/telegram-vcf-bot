@@ -14,12 +14,14 @@ const SLEEP_BETWEEN_FILES_MS = 1200;
    ENV
 ======================= */
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const SHEET_ID = process.env.SHEET_ID;
-const GOOGLE_CREDENTIALS = process.env.GOOGLE_CREDENTIALS;
+const SHEET_ID = process.env.SHEET_ID; // WAJIB: hanya ID (bukan URL)
+const GOOGLE_CREDENTIALS = process.env.GOOGLE_CREDENTIALS; // WAJIB: JSON service account full
 const PORT = process.env.PORT || 3000;
 const BASE_URL = process.env.RENDER_EXTERNAL_URL;
 
 const WEBHOOK_PATH = "/webhook";
+
+// Tabs (PASTIKAN NAMA TAB SAMA PERSIS DI GOOGLE SHEET)
 const SHEET_NAME = "DB GDS"; // stok: A=FRESH, D=FU, G1=nomor jagaan
 const REPORT_SHEET = "REPORT"; // harian (DB)
 const STAFF_SHEET = "STAFF_REPORT"; // staff (DB)
@@ -27,7 +29,7 @@ const LASTREQ_SHEET = "LAST_REQUEST"; // last request log
 const STAFF_USERS_SHEET = "STAFF_USERS"; // mapping telegram id -> staff code
 
 if (!BOT_TOKEN || !SHEET_ID || !GOOGLE_CREDENTIALS || !BASE_URL) {
-  console.error("❌ ENV belum lengkap");
+  console.error("❌ ENV belum lengkap. Wajib: BOT_TOKEN, SHEET_ID, GOOGLE_CREDENTIALS, RENDER_EXTERNAL_URL");
   process.exit(1);
 }
 
@@ -79,24 +81,14 @@ http
 ======================= */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// "17.000" -> 17000
 const parseNumberLoose = (v) => {
   const digits = String(v ?? "").replace(/\D/g, "");
   return digits ? parseInt(digits, 10) : 0;
 };
 
 function formatID(n) {
-  // 17000 -> "17.000"
   const s = String(Math.trunc(Number(n) || 0));
   return s.replace(/\B(?=(\d{3})+(?!\d))/g, ".");
-}
-function padRight(str, len) {
-  const s = String(str ?? "");
-  return s.length >= len ? s.slice(0, len) : s + " ".repeat(len - s.length);
-}
-function padLeft(str, len) {
-  const s = String(str ?? "");
-  return s.length >= len ? s.slice(0, len) : " ".repeat(len - s.length) + s;
 }
 
 function nowWIBIso() {
@@ -126,6 +118,16 @@ function getTelegramDisplayName(msg) {
   const full = parts.join(" ").trim();
   if (u?.username) return `${full ? full + " " : ""}(@${u.username})`;
   return full || "UNKNOWN";
+}
+
+async function safeSend(chatId, text, opts = {}) {
+  try {
+    await bot.sendMessage(chatId, text, opts);
+    return true;
+  } catch (e) {
+    console.error("❌ sendMessage failed:", e?.message || e);
+    return false;
+  }
 }
 
 /* =======================
@@ -276,7 +278,11 @@ async function getReportRow(dateStr) {
   for (let i = 0; i < rows.length; i++) {
     const [date, fresh, fu] = rows[i] || [];
     if (String(date || "").trim() === dateStr) {
-      return { rowIndex: i + 2, fresh: parseNumberLoose(fresh), fu: parseNumberLoose(fu) };
+      return {
+        rowIndex: i + 2,
+        fresh: parseNumberLoose(fresh),
+        fu: parseNumberLoose(fu),
+      };
     }
   }
   return { rowIndex: null, fresh: 0, fu: 0 };
@@ -484,46 +490,45 @@ async function getStaffReportByMonth(month, year) {
   return { year, month: mm, rows: arr };
 }
 
+/* =======================
+   STAFF REPORT RENDER (ENAK DIBACA DI TELEGRAM)
+======================= */
 function renderStaffTable(title, rows) {
-  if (!rows.length) return `${title}\nBelum ada data.`;
+  if (!rows.length) return `${title}\n\nBelum ada data.`;
 
-  const nameWidth = 14;
-  const header =
-    `${title}\n` +
-    "```" +
-    "\n" +
-    padRight("NO", 3) +
-    padRight("STAFF", nameWidth + 2) +
-    padLeft("FRESH", 7) +
-    padLeft("FU", 7) +
-    padLeft("TOTAL", 8) +
-    "\n" +
-    "-".repeat(3 + (nameWidth + 2) + 7 + 7 + 8);
+  const out = [];
+  out.push(`${title}`);
+  out.push("────────────────────");
 
-  const lines = rows.map((r, i) => {
-    const staff = padRight(String(r.staffCode || "UNKNOWN"), nameWidth) + "  ";
-    const fresh = padLeft(formatID(r.fresh), 7);
-    const fu = padLeft(formatID(r.fu), 7);
-    const total = padLeft(formatID(r.totalDB ?? (r.fresh + r.fu)), 8);
-    return "\n" + padRight(String(i + 1), 3) + staff + fresh + fu + total;
+  rows.forEach((r, i) => {
+    const staff = String(r.staffCode || "UNKNOWN").trim() || "UNKNOWN";
+
+    const freshDB = Number(r.fresh) || 0;
+    const fuDB = Number(r.fu) || 0;
+    const totalDB = Number(r.totalDB ?? (freshDB + fuDB)) || 0;
+
+    const freshNum = freshDB * DB_SIZE;
+    const fuNum = fuDB * DB_SIZE;
+    const totalNum = totalDB * DB_SIZE;
+
+    out.push(`${i + 1}. ${staff}`);
+    out.push(`   • FRESH : ${formatID(freshDB)} DB (${formatID(freshNum)} Nomor)`);
+    out.push(`   • FU    : ${formatID(fuDB)} DB (${formatID(fuNum)} Nomor)`);
+    out.push(`   • TOTAL : ${formatID(totalDB)} DB (${formatID(totalNum)} Nomor)`);
+    out.push("");
   });
 
   const sumFresh = rows.reduce((a, r) => a + (Number(r.fresh) || 0), 0);
   const sumFu = rows.reduce((a, r) => a + (Number(r.fu) || 0), 0);
   const sumTotal = sumFresh + sumFu;
 
-  const footer =
-    "\n" +
-    "-".repeat(3 + (nameWidth + 2) + 7 + 7 + 8) +
-    "\n" +
-    padRight("", 3) +
-    padRight("TOTAL", nameWidth + 2) +
-    padLeft(formatID(sumFresh), 7) +
-    padLeft(formatID(sumFu), 7) +
-    padLeft(formatID(sumTotal), 8) +
-    "\n```";
+  out.push("────────────────────");
+  out.push("TOTAL KESELURUHAN");
+  out.push(`• FRESH : ${formatID(sumFresh)} DB (${formatID(sumFresh * DB_SIZE)} Nomor)`);
+  out.push(`• FU    : ${formatID(sumFu)} DB (${formatID(sumFu * DB_SIZE)} Nomor)`);
+  out.push(`• TOTAL : ${formatID(sumTotal)} DB (${formatID(sumTotal * DB_SIZE)} Nomor)`);
 
-  return header + lines.join("") + footer;
+  return out.join("\n");
 }
 
 /* =======================
@@ -609,13 +614,16 @@ async function processQueue() {
   const { chatId, userId, dbCount, type, staffCode } = queue.shift();
   const { col, label } = COMMANDS[type];
 
+  let filesSent = 0;
+  let reportUpdated = false;
+
   try {
-    await bot.sendMessage(chatId, "✅ Cek Japri bro...");
-    await bot.sendMessage(userId, "⏳ Sebentar Bro...");
+    await safeSend(chatId, "✅ Cek japri bro...");
+    await safeSend(userId, "⏳ Sebentar bro...");
 
     const guard = await getGuardNumber();
     if (!guard || guard.length < 10) {
-      await bot.sendMessage(chatId, `❌ Nomor jagaan kosong / invalid. Isi dulu di ${SHEET_NAME}!G1`);
+      await safeSend(chatId, `❌ Nomor jagaan kosong / invalid. Isi dulu di ${SHEET_NAME}!G1`);
       busy = false;
       return processQueue();
     }
@@ -631,7 +639,7 @@ async function processQueue() {
 
     const required = STOCK_TAKE_PER_DB * dbCount;
     if (numbers.length < required) {
-      await bot.sendMessage(
+      await safeSend(
         chatId,
         `❌ Stok tidak cukup.\nButuh: ${required} nomor stok (${STOCK_TAKE_PER_DB}×${dbCount} DB)\nTersedia: ${numbers.length}`
       );
@@ -654,11 +662,13 @@ async function processQueue() {
       const pack = dbPacks[i];
 
       const vcardText = pack
-        .map((n, idx) => `BEGIN:VCARD
+        .map(
+          (n, idx) => `BEGIN:VCARD
 VERSION:3.0
 FN:${label}-DB${i + 1}-${idx + 1}
 TEL;TYPE=CELL:${n}
-END:VCARD`)
+END:VCARD`
+        )
         .join("\n");
 
       const buffer = Buffer.from(vcardText, "utf8");
@@ -670,14 +680,17 @@ END:VCARD`)
         { filename: `${label}_DB_${i + 1}.vcf`, contentType: "text/vcard" }
       );
 
+      filesSent++;
       await sleep(SLEEP_BETWEEN_FILES_MS);
     }
 
+    // clear stok col
     await sheets.spreadsheets.values.clear({
       spreadsheetId: SHEET_ID,
       range: `${SHEET_NAME}!${col}:${col}`,
     });
 
+    // append remaining back
     if (remain.length) {
       await sheets.spreadsheets.values.append({
         spreadsheetId: SHEET_ID,
@@ -687,19 +700,41 @@ END:VCARD`)
       });
     }
 
+    // update report sheets
     const rep = await addToReport(type, dbCount);
     const dateStr = rep?.dateStr || todayKeyWIB();
 
     await addToStaffReport(dateStr, staffCode, type, dbCount);
     await upsertLastRequest(userId, staffCode, type, dbCount);
+    reportUpdated = true;
 
-    await bot.sendMessage(
-      userId,
-      `✅ BERES!\n👤 Staff: ${staffCode}\n📦 Request: ${dbCount} DB\n📇 Total kontak: ${formatID(dbCount * DB_SIZE)} (termasuk jagaan)\n\n📊 REPORT HARI INI (${dateStr})\nFRESH(DB): ${rep.fresh}\nFU(DB): ${rep.fu}`
-    );
+    // ✅ TEMPLATE FINAL — TANPA "REPORT HARI INI"
+await safeSend(
+  userId,
+  `✅ BERES!\n` +
+    `👤 Staff: ${staffCode}\n` +
+    `📦 Request: ${formatID(dbCount)} DB\n` +
+    `📇 Total Kontak: ${formatID(dbCount * DB_SIZE)} Nomor (termasuk jagaan)\n\n` +
+    `⚠️ PASTIKAN JANGAN SALAH TEMPLATE`
+);
   } catch (e) {
     console.error("❌ ERROR:", e);
-    await bot.sendMessage(chatId, "❌ Gagal proses. Pastikan kamu sudah /start bot di japri.");
+
+    // Jangan misleading kalau file sudah kekirim
+    if (filesSent > 0) {
+      await safeSend(
+        chatId,
+        `⚠️ File DB sudah terkirim (${filesSent}/${dbCount} file).\nTapi ada error saat update report / notifikasi.\nCek tab REPORT/STAFF_REPORT/LAST_REQUEST atau Render Logs.`
+      );
+      if (!reportUpdated) {
+        await safeSend(
+          userId,
+          `⚠️ File DB sudah terkirim, tapi report belum ke-update.\nCek tab REPORT/STAFF_REPORT/LAST_REQUEST sudah ada & izin Editor.`
+        );
+      }
+    } else {
+      await safeSend(chatId, "❌ Gagal proses. Pastikan kamu sudah /start bot di japri.");
+    }
   }
 
   busy = false;
@@ -722,17 +757,17 @@ bot.on("message", async (msg) => {
     const display = getTelegramDisplayName(msg);
 
     if (code.length < 3) {
-      await bot.sendMessage(chatId, "❌ Kode staff kependekan. Contoh: GDS 01");
+      await safeSend(chatId, "❌ Kode staff kependekan. Contoh: GDS 01");
       return;
     }
 
     try {
       await upsertStaffCode(userId, code, display);
       pendingStaffCode.delete(String(userId));
-      await bot.sendMessage(chatId, `✅ Oke, staff kamu diset: ${code}\nSekarang bisa request DB.`);
+      await safeSend(chatId, `✅ Oke, staff kamu diset: ${code}\nSekarang bisa request DB.`);
     } catch (e) {
       console.error("❌ set staff code error:", e);
-      await bot.sendMessage(chatId, "❌ Gagal simpan staff code. Coba lagi.");
+      await safeSend(chatId, "❌ Gagal simpan staff code. Coba lagi.");
     }
     return;
   }
@@ -742,20 +777,20 @@ bot.on("message", async (msg) => {
       const code = await getStaffCode(userId);
       if (!code) {
         pendingStaffCode.add(String(userId));
-        await bot.sendMessage(
+        await safeSend(
           chatId,
           "✅ Bot aktif.\n\nPertama, kirim KODE STAFF kamu ya.\nContoh:\nGDS 01\n\n(ketik kode saja, tanpa #, tanpa /)"
         );
         return;
       }
 
-      await bot.sendMessage(
+      await safeSend(
         chatId,
         `✅ Bot aktif.\n👤 Staff: ${code}\n\nREQUEST (per DB, 1 DB = ${DB_SIZE} nomor):\n#vcardfresh JUMLAH_DB\n#vcardfu JUMLAH_DB\n\nNomor jagaan: ambil dari ${SHEET_NAME}!G1 (disisipkan tiap DB)\n\nLaporan:\n/report\n/reportdate YYYY-MM-DD\n/reportmonth BULAN TAHUN\n/reportstaff\n/reportstaffdate YYYY-MM-DD\n/reportstaffmonth BULAN TAHUN\n/lastrequest\n/stafflist\n/setstaff KODE (ganti)\n/reset (opsional)\n\nContoh:\n#vcardfu 5`
       );
     } catch (e) {
       console.error("❌ /start error:", e);
-      await bot.sendMessage(chatId, "❌ Error /start. Coba lagi.");
+      await safeSend(chatId, "❌ Error /start. Coba lagi.");
     }
     return;
   }
@@ -767,10 +802,10 @@ bot.on("message", async (msg) => {
     try {
       await upsertStaffCode(userId, code, display);
       pendingStaffCode.delete(String(userId));
-      await bot.sendMessage(chatId, `✅ Staff code kamu sekarang: ${code}`);
+      await safeSend(chatId, `✅ Staff code kamu sekarang: ${code}`);
     } catch (e) {
       console.error("❌ /setstaff error:", e);
-      await bot.sendMessage(chatId, "❌ Gagal set staff code.");
+      await safeSend(chatId, "❌ Gagal set staff code.");
     }
     return;
   }
@@ -779,16 +814,16 @@ bot.on("message", async (msg) => {
     try {
       const rows = await listStaffUsers(50);
       if (!rows.length) {
-        await bot.sendMessage(chatId, "📋 STAFF LIST\nBelum ada data.");
+        await safeSend(chatId, "📋 STAFF LIST\nBelum ada data.");
         return;
       }
       const lines = rows.map(
         (r, i) => `${i + 1}. ${r.staffCode} — ${r.name} — ID:${r.userId} — ${r.updatedAt}`
       );
-      await bot.sendMessage(chatId, "📋 STAFF LIST (terbaru)\n" + lines.join("\n"));
+      await safeSend(chatId, "📋 STAFF LIST (terbaru)\n" + lines.join("\n"));
     } catch (e) {
       console.error("❌ /stafflist error:", e);
-      await bot.sendMessage(chatId, "❌ Gagal ambil staff list.");
+      await safeSend(chatId, "❌ Gagal ambil staff list.");
     }
     return;
   }
@@ -797,13 +832,13 @@ bot.on("message", async (msg) => {
     try {
       const rep = await getReportToday();
       const stock = await getStockCounts();
-      await bot.sendMessage(
+      await safeSend(
         chatId,
         `📊 REPORT HARI INI (${rep.dateStr})\n✅ FRESH(DB): ${rep.fresh} (≈${formatID(rep.fresh * DB_SIZE)} nomor)\n✅ FU(DB): ${rep.fu} (≈${formatID(rep.fu * DB_SIZE)} nomor)\n\n📦 SISA STOK (nomor)\nFRESH(A): ${formatID(stock.freshLeft)} (≈${stock.freshDBPossible} DB)\nFU(D): ${formatID(stock.fuLeft)} (≈${stock.fuDBPossible} DB)`
       );
     } catch (e) {
       console.error("❌ /report ERROR:", e);
-      await bot.sendMessage(chatId, "❌ Gagal ambil report.");
+      await safeSend(chatId, "❌ Gagal ambil report.");
     }
     return;
   }
@@ -814,16 +849,16 @@ bot.on("message", async (msg) => {
     try {
       const rep = await getReportByDate(dateStr);
       if (!rep.found) {
-        await bot.sendMessage(chatId, `📊 REPORT ${dateStr}\nData tidak ditemukan.`);
+        await safeSend(chatId, `📊 REPORT ${dateStr}\nData tidak ditemukan.`);
       } else {
-        await bot.sendMessage(
+        await safeSend(
           chatId,
           `📊 REPORT ${dateStr}\n✅ FRESH(DB): ${rep.fresh} (≈${formatID(rep.fresh * DB_SIZE)} nomor)\n✅ FU(DB): ${rep.fu} (≈${formatID(rep.fu * DB_SIZE)} nomor)`
         );
       }
     } catch (e) {
       console.error("❌ /reportdate ERROR:", e);
-      await bot.sendMessage(chatId, "❌ Gagal ambil report tanggal.");
+      await safeSend(chatId, "❌ Gagal ambil report tanggal.");
     }
     return;
   }
@@ -833,18 +868,18 @@ bot.on("message", async (msg) => {
     const month = parseInt(rm[1], 10);
     const year = parseInt(rm[2], 10);
     if (month < 1 || month > 12) {
-      await bot.sendMessage(chatId, "❌ Format salah. Contoh: /reportmonth 2 2026");
+      await safeSend(chatId, "❌ Format salah. Contoh: /reportmonth 2 2026");
       return;
     }
     try {
       const rep = await getReportMonth(month, year);
-      await bot.sendMessage(
+      await safeSend(
         chatId,
         `📅 REPORT BULAN ${rep.year}-${rep.month}\n✅ Total hari: ${rep.days}\n✅ FRESH(DB): ${rep.fresh}\n✅ FU(DB): ${rep.fu}`
       );
     } catch (e) {
       console.error("❌ /reportmonth ERROR:", e);
-      await bot.sendMessage(chatId, "❌ Gagal ambil report bulanan.");
+      await safeSend(chatId, "❌ Gagal ambil report bulanan.");
     }
     return;
   }
@@ -853,10 +888,10 @@ bot.on("message", async (msg) => {
     try {
       const dateStr = todayKeyWIB();
       const rows = await getStaffReportByDate(dateStr);
-      await bot.sendMessage(chatId, renderStaffTable(`📋 REPORT STAFF (${dateStr})`, rows));
+      await safeSend(chatId, renderStaffTable(`📋 REPORT STAFF (${dateStr})`, rows));
     } catch (e) {
       console.error("❌ /reportstaff ERROR:", e);
-      await bot.sendMessage(chatId, "❌ Gagal ambil report staff.");
+      await safeSend(chatId, "❌ Gagal ambil report staff.");
     }
     return;
   }
@@ -866,10 +901,10 @@ bot.on("message", async (msg) => {
     const dateStr = rsd[1];
     try {
       const rows = await getStaffReportByDate(dateStr);
-      await bot.sendMessage(chatId, renderStaffTable(`📋 REPORT STAFF (${dateStr})`, rows));
+      await safeSend(chatId, renderStaffTable(`📋 REPORT STAFF (${dateStr})`, rows));
     } catch (e) {
       console.error("❌ /reportstaffdate ERROR:", e);
-      await bot.sendMessage(chatId, "❌ Gagal ambil report staff tanggal.");
+      await safeSend(chatId, "❌ Gagal ambil report staff tanggal.");
     }
     return;
   }
@@ -879,18 +914,18 @@ bot.on("message", async (msg) => {
     const month = parseInt(rsm[1], 10);
     const year = parseInt(rsm[2], 10);
     if (month < 1 || month > 12) {
-      await bot.sendMessage(chatId, "❌ Format salah. Contoh: /reportstaffmonth 2 2026");
+      await safeSend(chatId, "❌ Format salah. Contoh: /reportstaffmonth 2 2026");
       return;
     }
     try {
       const rep = await getStaffReportByMonth(month, year);
-      await bot.sendMessage(
+      await safeSend(
         chatId,
         renderStaffTable(`📋 REPORT STAFF BULAN ${rep.year}-${rep.month}`, rep.rows)
       );
     } catch (e) {
       console.error("❌ /reportstaffmonth ERROR:", e);
-      await bot.sendMessage(chatId, "❌ Gagal ambil report staff bulanan.");
+      await safeSend(chatId, "❌ Gagal ambil report staff bulanan.");
     }
     return;
   }
@@ -899,17 +934,17 @@ bot.on("message", async (msg) => {
     try {
       const rows = await getLastRequests(30);
       if (!rows.length) {
-        await bot.sendMessage(chatId, "📌 LAST REQUEST\nBelum ada data.");
+        await safeSend(chatId, "📌 LAST REQUEST\nBelum ada data.");
         return;
       }
       const lines = rows.map(
         (r, i) =>
           `${i + 1}. ${r.staffCode} (ID:${r.userId}) — ${r.type} ${r.dbCount} DB — ${r.lastAt}`
       );
-      await bot.sendMessage(chatId, "📌 LAST REQUEST (terbaru)\n" + lines.join("\n"));
+      await safeSend(chatId, "📌 LAST REQUEST (terbaru)\n" + lines.join("\n"));
     } catch (e) {
       console.error("❌ /lastrequest ERROR:", e);
-      await bot.sendMessage(chatId, "❌ Gagal ambil last request.");
+      await safeSend(chatId, "❌ Gagal ambil last request.");
     }
     return;
   }
@@ -917,10 +952,10 @@ bot.on("message", async (msg) => {
   if (text === "/reset") {
     try {
       const rep = await resetReportToday();
-      await bot.sendMessage(chatId, `♻️ Report hari ini di-reset (${rep.dateStr}).`);
+      await safeSend(chatId, `♻️ Report hari ini di-reset (${rep.dateStr}).`);
     } catch (e) {
       console.error("❌ /reset ERROR:", e);
-      await bot.sendMessage(chatId, "❌ Gagal reset report.");
+      await safeSend(chatId, "❌ Gagal reset report.");
     }
     return;
   }
@@ -933,20 +968,20 @@ bot.on("message", async (msg) => {
   const dbCount = parseInt(m[2], 10);
 
   if (!Number.isFinite(dbCount) || dbCount <= 0) {
-    await bot.sendMessage(chatId, "❌ JUMLAH_DB harus angka > 0");
+    await safeSend(chatId, "❌ JUMLAH_DB harus angka > 0");
     return;
   }
 
   const staffCode = await getStaffCode(userId);
   if (!staffCode) {
     pendingStaffCode.add(String(userId));
-    await bot.sendMessage(chatId, "❌ Kamu belum set KODE STAFF.\nKetik dulu contoh: GDS 01");
+    await safeSend(chatId, "❌ Kamu belum set KODE STAFF.\nKetik dulu contoh: GDS 01");
     return;
   }
 
   queue.push({ chatId, userId, staffCode, type, dbCount });
-  await bot.sendMessage(chatId, "📥 Cek japri Bro");
+  await safeSend(chatId, "📥 Cek japri bro...");
   processQueue();
 });
 
-console.log("🤖 BOT FINAL — REPORT STAFF RAPI (TABLE) + STAFF CODE + PER DB");
+console.log("🤖 BOT FINAL — DB GDS + STAFF REPORT (LIST) + STAFF CODE + PER DB");
