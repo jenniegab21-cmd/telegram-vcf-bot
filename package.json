@@ -1,10 +1,16 @@
 {
-  "name": "telegram-vcard-bot",
+  "name": "telegram-vcf-bot",
   "version": "1.0.0",
   "type": "module",
   "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
-    "node-telegram-bot-api": "^0.61.0",
-    "googleapis": "^144.0.0"
+    "googleapis": "^144.0.0",
+    "node-telegram-bot-api": "^0.66.0"
   }
 }
