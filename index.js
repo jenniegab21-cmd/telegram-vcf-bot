@@ -9,24 +9,31 @@ import url from "url";
 const DB_SIZE = 250; // 1 DB = 250 nomor (termasuk nomor jagaan)
 const STOCK_TAKE_PER_DB = DB_SIZE - 1; // yang diambil dari stok per DB (karena 1 slot diisi jagaan)
 const SLEEP_BETWEEN_FILES_MS = 1200;
+const CLEAR_DELETE_DELAY_MS = 220; // biar ga kena rate limit delete
 
 /* =======================
    ENV
 ======================= */
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const SHEET_ID = process.env.SHEET_ID; // WAJIB: hanya ID (bukan URL)
-const GOOGLE_CREDENTIALS = process.env.GOOGLE_CREDENTIALS; // WAJIB: JSON service account full
+const SHEET_ID = process.env.SHEET_ID; // ID saja, bukan URL
+const GOOGLE_CREDENTIALS = process.env.GOOGLE_CREDENTIALS; // JSON service account full
 const PORT = process.env.PORT || 3000;
 const BASE_URL = process.env.RENDER_EXTERNAL_URL;
 
 const WEBHOOK_PATH = "/webhook";
 
-// Tabs (PASTIKAN NAMA TAB SAMA PERSIS DI GOOGLE SHEET)
-const SHEET_NAME = "DB GDS"; // stok: A=FRESH, D=FU, G1=nomor jagaan
-const REPORT_SHEET = "REPORT"; // harian (DB)
+// Tabs (PASTIKAN SAMA PERSIS)
+const SHEET_NAME = "DB GDS"; // stok: A=FRESH, D=FU, G1:G10=nomor jagaan
+const REPORT_SHEET = "REPORT"; // harian (DB) - optional masih dipakai buat /report
 const STAFF_SHEET = "STAFF_REPORT"; // staff (DB)
 const LASTREQ_SHEET = "LAST_REQUEST"; // last request log
 const STAFF_USERS_SHEET = "STAFF_USERS"; // mapping telegram id -> staff code
+
+// Cells config (di sheet DB GDS)
+const GUARD_RANGE = `${SHEET_NAME}!G1:G10`; // max 10 nomor jagaan
+const GUARD_PTR_CELL = `${SHEET_NAME}!H1`; // pointer jagaan (0..9) (kalau kosong auto 0)
+const CFG_RANGE = `${SHEET_NAME}!I1:I4`; // I1=Nama DB Fresh, I2=Nama Contact Fresh, I3=Nama DB FU, I4=Nama Contact FU
+const PIN_CELL = `${SHEET_NAME}!K1`; // PIN clear
 
 if (!BOT_TOKEN || !SHEET_ID || !GOOGLE_CREDENTIALS || !BASE_URL) {
   console.error("❌ ENV belum lengkap. Wajib: BOT_TOKEN, SHEET_ID, GOOGLE_CREDENTIALS, RENDER_EXTERNAL_URL");
@@ -91,6 +98,11 @@ function formatID(n) {
   return s.replace(/\B(?=(\d{3})+(?!\d))/g, ".");
 }
 
+function pad3(n) {
+  const x = Math.max(0, Math.trunc(Number(n) || 0));
+  return String(x).padStart(3, "0");
+}
+
 function nowWIBIso() {
   const d = new Date();
   const wib = new Date(d.getTime() + 7 * 60 * 60 * 1000);
@@ -122,12 +134,93 @@ function getTelegramDisplayName(msg) {
 
 async function safeSend(chatId, text, opts = {}) {
   try {
-    await bot.sendMessage(chatId, text, opts);
-    return true;
+    const m = await bot.sendMessage(chatId, text, opts);
+    if (m?.message_id != null) trackBotMessage(chatId, m.message_id);
+    return m;
   } catch (e) {
     console.error("❌ sendMessage failed:", e?.message || e);
-    return false;
+    return null;
   }
+}
+
+function sanitizeName(s) {
+  return String(s ?? "")
+    .trim()
+    .replace(/[^\w\-]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 40);
+}
+
+function isPrivateChat(msg) {
+  return msg?.chat?.type === "private";
+}
+
+/* =======================
+   CONFIG READERS (Sheet)
+======================= */
+async function getPinClear() {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: PIN_CELL,
+  });
+  const raw = res.data.values?.[0]?.[0] ?? "";
+  return String(raw).trim();
+}
+
+async function getNamingConfig() {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: CFG_RANGE,
+  });
+  const v = res.data.values || [];
+  const i1 = String(v?.[0]?.[0] ?? "").trim(); // nama db fresh
+  const i2 = String(v?.[1]?.[0] ?? "").trim(); // nama contact fresh
+  const i3 = String(v?.[2]?.[0] ?? "").trim(); // nama db fu
+  const i4 = String(v?.[3]?.[0] ?? "").trim(); // nama contact fu
+
+  return {
+    dbFresh: i1 || "FRESH",
+    contactFresh: i2 || "FRESH",
+    dbFu: i3 || "FU",
+    contactFu: i4 || "FU",
+  };
+}
+
+async function getGuardList() {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: GUARD_RANGE,
+  });
+  const raw = res.data.values || [];
+  const guards = raw
+    .map((r) => String(r?.[0] ?? "").replace(/\D/g, ""))
+    .filter((x) => x.length >= 10);
+  return guards.slice(0, 10);
+}
+
+async function getGuardPointer() {
+  try {
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: GUARD_PTR_CELL,
+    });
+    const raw = res.data.values?.[0]?.[0] ?? "";
+    const n = parseInt(String(raw).replace(/\D/g, ""), 10);
+    return Number.isFinite(n) ? Math.max(0, Math.min(9, n)) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function setGuardPointer(ptr) {
+  const p = Math.max(0, Math.min(9, Math.trunc(Number(ptr) || 0)));
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID,
+    range: GUARD_PTR_CELL,
+    valueInputOption: "RAW",
+    requestBody: { values: [[String(p)]] },
+  });
 }
 
 /* =======================
@@ -222,17 +315,8 @@ async function listStaffUsers(limit = 50) {
 }
 
 /* =======================
-   Guard number
+   Guard (old single guard) - removed
 ======================= */
-async function getGuardNumber() {
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: `${SHEET_NAME}!G1`,
-  });
-
-  const raw = res.data.values?.[0]?.[0] ?? "";
-  return String(raw).replace(/\D/g, "");
-}
 
 /* =======================
    Stock counts
@@ -278,11 +362,7 @@ async function getReportRow(dateStr) {
   for (let i = 0; i < rows.length; i++) {
     const [date, fresh, fu] = rows[i] || [];
     if (String(date || "").trim() === dateStr) {
-      return {
-        rowIndex: i + 2,
-        fresh: parseNumberLoose(fresh),
-        fu: parseNumberLoose(fu),
-      };
+      return { rowIndex: i + 2, fresh: parseNumberLoose(fresh), fu: parseNumberLoose(fu) };
     }
   }
   return { rowIndex: null, fresh: 0, fu: 0 };
@@ -491,9 +571,9 @@ async function getStaffReportByMonth(month, year) {
 }
 
 /* =======================
-   STAFF REPORT RENDER (ENAK DIBACA DI TELEGRAM)
+   STAFF REPORT RENDER (ENAK DIBACA)
 ======================= */
-function renderStaffTable(title, rows) {
+function renderStaffList(title, rows) {
   if (!rows.length) return `${title}\n\nBelum ada data.`;
 
   const out = [];
@@ -532,12 +612,20 @@ function renderStaffTable(title, rows) {
 }
 
 /* =======================
-   LAST REQUEST
+   LAST REQUEST (rapihin kayak staff list)
+   Sheet columns:
+   A USER_ID
+   B STAFF_CODE
+   C LAST_AT
+   D TYPE
+   E DB_COUNT
+   F CHAT_ID (optional)
+   G MSG_IDS (optional, comma-separated)
 ======================= */
-async function upsertLastRequest(userId, staffCode, type, dbCount) {
+async function upsertLastRequest(userId, staffCode, type, dbCount, chatId, msgIds = []) {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
-    range: `${LASTREQ_SHEET}!A2:E`,
+    range: `${LASTREQ_SHEET}!A2:G`,
   });
 
   const rows = res.data.values || [];
@@ -553,29 +641,33 @@ async function upsertLastRequest(userId, staffCode, type, dbCount) {
   }
 
   const lastAt = nowWIBIso();
+  const chatIdStr = String(chatId ?? "");
+  const msgStr = (msgIds || []).map(String).join(",");
+
+  const payload = [[uidStr, staffCode, lastAt, type, dbCount, chatIdStr, msgStr]];
 
   if (!rowIndex) {
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
       range: `${LASTREQ_SHEET}!A1`,
       valueInputOption: "RAW",
-      requestBody: { values: [[uidStr, staffCode, lastAt, type, dbCount]] },
+      requestBody: { values: payload },
     });
     return;
   }
 
   await sheets.spreadsheets.values.update({
     spreadsheetId: SHEET_ID,
-    range: `${LASTREQ_SHEET}!A${rowIndex}:E${rowIndex}`,
+    range: `${LASTREQ_SHEET}!A${rowIndex}:G${rowIndex}`,
     valueInputOption: "RAW",
-    requestBody: { values: [[uidStr, staffCode, lastAt, type, dbCount]] },
+    requestBody: { values: payload },
   });
 }
 
 async function getLastRequests(limit = 30) {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
-    range: `${LASTREQ_SHEET}!A2:E`,
+    range: `${LASTREQ_SHEET}!A2:G`,
   });
 
   const rows = res.data.values || [];
@@ -586,6 +678,13 @@ async function getLastRequests(limit = 30) {
       lastAt: String(r?.[2] || "").trim(),
       type: String(r?.[3] || "").trim(),
       dbCount: parseNumberLoose(r?.[4]),
+      chatId: String(r?.[5] || "").trim(),
+      msgIds: String(r?.[6] || "")
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean)
+        .map((x) => parseInt(x, 10))
+        .filter((n) => Number.isFinite(n)),
     }))
     .filter((x) => x.userId);
 
@@ -593,12 +692,35 @@ async function getLastRequests(limit = 30) {
   return data.slice(0, limit);
 }
 
+function renderLastReqList(rows) {
+  if (!rows.length) return "📌 LAST REQUEST\n\nBelum ada data.";
+
+  const out = [];
+  out.push("📌 LAST REQUEST");
+  out.push("────────────────────");
+
+  rows.forEach((r, i) => {
+    const t = (r.type || "").toLowerCase();
+    const typeLabel = t === "vcardfresh" ? "FRESH" : t === "vcardfu" ? "FU" : (r.type || "UNKNOWN");
+    const nomor = (Number(r.dbCount) || 0) * DB_SIZE;
+
+    out.push(`${i + 1}. ${r.staffCode || "UNKNOWN"}`);
+    out.push(`   • TYPE  : ${typeLabel}`);
+    out.push(`   • DB    : ${formatID(r.dbCount)} DB`);
+    out.push(`   • NOMOR : ${formatID(nomor)} Nomor`);
+    out.push(`   • WAKTU : ${r.lastAt || "-"}`);
+    out.push("");
+  });
+
+  return out.join("\n");
+}
+
 /* =======================
    COMMAND MAP (stok)
 ======================= */
 const COMMANDS = {
-  vcardfresh: { col: "A", label: "FRESH" },
-  vcardfu: { col: "D", label: "FU" },
+  vcardfresh: { col: "A", typeLabel: "FRESH" },
+  vcardfu: { col: "D", typeLabel: "FU" },
 };
 
 /* =======================
@@ -607,26 +729,122 @@ const COMMANDS = {
 const queue = [];
 let busy = false;
 
+/* =======================
+   Bot message tracking (for /clear)
+======================= */
+const botMsgMemory = new Map(); // chatId -> Set(messageId)
+
+function trackBotMessage(chatId, messageId) {
+  const key = String(chatId);
+  const set = botMsgMemory.get(key) || new Set();
+  set.add(Number(messageId));
+  // batasi biar gak kebanyakan
+  if (set.size > 250) {
+    const arr = Array.from(set);
+    arr.slice(0, arr.length - 250).forEach((x) => set.delete(x));
+  }
+  botMsgMemory.set(key, set);
+}
+
+/* =======================
+   /clear flow
+======================= */
+const pendingClearPin = new Set(); // userId waiting pin
+
+async function clearBotMessagesInChat(chatId, msgIds = []) {
+  const ids = []
+    .concat(msgIds || [])
+    .concat(Array.from(botMsgMemory.get(String(chatId)) || []))
+    .filter((x) => Number.isFinite(Number(x)))
+    .map((x) => Number(x));
+
+  // unique
+  const uniq = Array.from(new Set(ids));
+
+  // delete from newest-ish (descending) to reduce "message to delete not found" issues
+  uniq.sort((a, b) => b - a);
+
+  let ok = 0;
+  let fail = 0;
+
+  for (const mid of uniq) {
+    try {
+      // deleteMessage(chatId, messageId)
+      await bot.deleteMessage(chatId, String(mid));
+      ok += 1;
+      await sleep(CLEAR_DELETE_DELAY_MS);
+    } catch {
+      fail += 1;
+    }
+  }
+
+  // reset memory for that chat
+  botMsgMemory.delete(String(chatId));
+
+  return { ok, fail, total: uniq.length };
+}
+
+/* =======================
+   PROCESS QUEUE
+======================= */
 async function processQueue() {
   if (busy || queue.length === 0) return;
   busy = true;
 
-  const { chatId, userId, dbCount, type, staffCode } = queue.shift();
-  const { col, label } = COMMANDS[type];
+  const job = queue.shift();
+  const { chatId, userId, dbCount, type, staffCode } = job;
+  const { col, typeLabel } = COMMANDS[type];
 
   let filesSent = 0;
   let reportUpdated = false;
+  const msgIdsSentInPrivate = []; // message_id docs + final text
 
   try {
     await safeSend(chatId, "✅ Cek japri bro...");
     await safeSend(userId, "⏳ Sebentar bro...");
 
-    const guard = await getGuardNumber();
-    if (!guard || guard.length < 10) {
-      await safeSend(chatId, `❌ Nomor jagaan kosong / invalid. Isi dulu di ${SHEET_NAME}!G1`);
+    // Read configs
+    const guards = await getGuardList();
+    if (guards.length === 0) {
+      await safeSend(chatId, `❌ Nomor jagaan kosong. Isi dulu di ${SHEET_NAME}!G1:G10`);
       busy = false;
       return processQueue();
     }
+
+    const ptr0 = await getGuardPointer();
+    const needGuards = dbCount;
+    if (needGuards > 10) {
+      await safeSend(chatId, `❌ Max request 10 DB (karena jagaan max 10).`);
+      busy = false;
+      return processQueue();
+    }
+    if (guards.length < 10) {
+      // boleh, tapi tetap cek availability for this request with wrap
+    }
+
+    // Determine guard per DB sequential with pointer (wrap 0..9)
+    const guardPerDb = [];
+    for (let i = 0; i < dbCount; i++) {
+      const idx = (ptr0 + i) % 10;
+      const g = guards[idx];
+      if (!g || g.length < 10) {
+        await safeSend(
+          chatId,
+          `❌ Nomor jagaan G${idx + 1} kosong/invalid.\nIsi dulu semua jagaan di ${SHEET_NAME}!G1:G10`
+        );
+        busy = false;
+        return processQueue();
+      }
+      guardPerDb.push(g);
+    }
+
+    // Update pointer for next request
+    const ptrNext = (ptr0 + dbCount) % 10;
+    await setGuardPointer(ptrNext);
+
+    const naming = await getNamingConfig();
+    const dbName = type === "vcardfresh" ? naming.dbFresh : naming.dbFu;
+    const contactPrefix = type === "vcardfresh" ? naming.contactFresh : naming.contactFu;
 
     const res = await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID,
@@ -650,47 +868,60 @@ async function processQueue() {
     const selected = numbers.slice(0, required);
     const remain = numbers.slice(required);
 
+    // Build packs (each pack: 1 guard + 249 stok)
     const dbPacks = [];
     for (let i = 0; i < dbCount; i++) {
       const start = i * STOCK_TAKE_PER_DB;
       const end = start + STOCK_TAKE_PER_DB;
-      const pack = selected.slice(start, end);
-      dbPacks.push([guard, ...pack]);
+      const packStok = selected.slice(start, end);
+      dbPacks.push([guardPerDb[i], ...packStok]);
     }
+
+    // Contact numbering: reset each request, sequential across all contacts in request (not per DB)
+    // Example: PREFIX-001 .. PREFIX-1250
+    let contactCounter = 0;
 
     for (let i = 0; i < dbPacks.length; i++) {
       const pack = dbPacks[i];
 
       const vcardText = pack
-        .map(
-          (n, idx) => `BEGIN:VCARD
+        .map((n) => {
+          contactCounter += 1;
+          const fn = `${contactPrefix}-${pad3(contactCounter)}`;
+          return `BEGIN:VCARD
 VERSION:3.0
-FN:${label}-DB${i + 1}-${idx + 1}
+FN:${fn}
 TEL;TYPE=CELL:${n}
-END:VCARD`
-        )
+END:VCARD`;
+        })
         .join("\n");
 
       const buffer = Buffer.from(vcardText, "utf8");
 
-      await bot.sendDocument(
+      const fname = `${sanitizeName(dbName || typeLabel)}_DB_${i + 1}.vcf`;
+
+      const m = await bot.sendDocument(
         userId,
         buffer,
         {},
-        { filename: `${label}_DB_${i + 1}.vcf`, contentType: "text/vcard" }
+        { filename: fname, contentType: "text/vcard" }
       );
+
+      if (m?.message_id != null) {
+        msgIdsSentInPrivate.push(Number(m.message_id));
+        trackBotMessage(userId, Number(m.message_id));
+      }
 
       filesSent++;
       await sleep(SLEEP_BETWEEN_FILES_MS);
     }
 
-    // clear stok col
+    // Clear stock column then append remain
     await sheets.spreadsheets.values.clear({
       spreadsheetId: SHEET_ID,
       range: `${SHEET_NAME}!${col}:${col}`,
     });
 
-    // append remaining back
     if (remain.length) {
       await sheets.spreadsheets.values.append({
         spreadsheetId: SHEET_ID,
@@ -700,36 +931,37 @@ END:VCARD`
       });
     }
 
-    // update report sheets
+    // Update reports
     const rep = await addToReport(type, dbCount);
     const dateStr = rep?.dateStr || todayKeyWIB();
-
     await addToStaffReport(dateStr, staffCode, type, dbCount);
-    await upsertLastRequest(userId, staffCode, type, dbCount);
-    reportUpdated = true;
 
-    // ✅ TEMPLATE FINAL — TANPA "REPORT HARI INI"
-await safeSend(
-  userId,
-  `✅ BERES!\n` +
-    `👤 Staff: ${staffCode}\n` +
-    `📦 Request: ${formatID(dbCount)} DB\n` +
-    `📇 Total Kontak: ${formatID(dbCount * DB_SIZE)} Nomor (termasuk jagaan)\n\n` +
-    `⚠️ PASTIKAN JANGAN SALAH TEMPLATE`
-);
+    // ✅ FINAL TEMPLATE (no report today), + warning line
+    const doneMsg = await safeSend(
+      userId,
+      `✅ BERES!\n` +
+        `👤 Staff: ${staffCode}\n` +
+        `📦 Request: ${formatID(dbCount)} DB\n` +
+        `📇 Total Kontak: ${formatID(dbCount * DB_SIZE)} Nomor (termasuk jagaan)\n\n` +
+        `⚠️ PASTIKAN JANGAN SALAH TEMPLATE`
+    );
+    if (doneMsg?.message_id != null) msgIdsSentInPrivate.push(Number(doneMsg.message_id));
+
+    // Upsert last request (store chatId japri + msgIds)
+    await upsertLastRequest(userId, staffCode, type, dbCount, userId, msgIdsSentInPrivate);
+    reportUpdated = true;
   } catch (e) {
     console.error("❌ ERROR:", e);
 
-    // Jangan misleading kalau file sudah kekirim
     if (filesSent > 0) {
       await safeSend(
         chatId,
-        `⚠️ File DB sudah terkirim (${filesSent}/${dbCount} file).\nTapi ada error saat update report / notifikasi.\nCek tab REPORT/STAFF_REPORT/LAST_REQUEST atau Render Logs.`
+        `⚠️ File DB sudah terkirim (${filesSent}/${dbCount} file).\nTapi ada error saat update laporan.\nCek tab REPORT / STAFF_REPORT / LAST_REQUEST atau Render Logs.`
       );
       if (!reportUpdated) {
         await safeSend(
           userId,
-          `⚠️ File DB sudah terkirim, tapi report belum ke-update.\nCek tab REPORT/STAFF_REPORT/LAST_REQUEST sudah ada & izin Editor.`
+          `⚠️ File DB sudah terkirim, tapi report belum ke-update.\nCek tab REPORT / STAFF_REPORT / LAST_REQUEST sudah ada & izin Editor.`
         );
       }
     } else {
@@ -751,7 +983,59 @@ bot.on("message", async (msg) => {
   const userId = msg.from.id;
   const text = msg.text.trim();
 
-  // kalau user sedang diminta input staff code
+  // ===== /clear (manual, tidak ditulis di /start) =====
+  if (pendingClearPin.has(String(userId)) && !text.startsWith("/")) {
+    // user sedang input PIN
+    pendingClearPin.delete(String(userId));
+
+    const pin = String(text || "").trim();
+    try {
+      const realPin = await getPinClear();
+      if (!realPin) {
+        await safeSend(chatId, "❌ PIN belum diset di sheet (K1).");
+        return;
+      }
+      if (pin !== String(realPin).trim()) {
+        await safeSend(chatId, "❌ PIN salah.");
+        return;
+      }
+
+      if (!isPrivateChat(msg)) {
+        await safeSend(chatId, "❌ /clear hanya bisa di japri.");
+        return;
+      }
+
+      // Ambil msgIds terakhir user dari LAST_REQUEST (kalau ada)
+      const rows = await getLastRequests(200);
+      const last = rows.find((r) => String(r.userId) === String(userId)) || null;
+      const msgIds = last?.msgIds || [];
+
+      const result = await clearBotMessagesInChat(userId, msgIds);
+
+      // Kirim 1 pesan konfirmasi (ini akan muncul lagi, tapi ya minimal 1 baris)
+      await safeSend(
+        chatId,
+        `🧹 CLEAR SELESAI\n• Deleted: ${result.ok}/${result.total}\n• Failed: ${result.fail}`
+      );
+    } catch (e) {
+      console.error("❌ /clear pin error:", e);
+      await safeSend(chatId, "❌ Gagal clear chat (cek Render Logs).");
+    }
+    return;
+  }
+
+  if (text === "/clear") {
+    // tidak muncul di /start menu, tapi bisa dipakai manual
+    if (!isPrivateChat(msg)) {
+      await safeSend(chatId, "❌ /clear hanya bisa di japri.");
+      return;
+    }
+    pendingClearPin.add(String(userId));
+    await safeSend(chatId, "🔐 Masukkan PIN untuk CLEAR (lihat K1):");
+    return;
+  }
+
+  // ===== staff code pending =====
   if (pendingStaffCode.has(String(userId)) && !text.startsWith("/")) {
     const code = normalizeStaffCode(text);
     const display = getTelegramDisplayName(msg);
@@ -772,6 +1056,7 @@ bot.on("message", async (msg) => {
     return;
   }
 
+  // ===== /start =====
   if (text === "/start") {
     try {
       const code = await getStaffCode(userId);
@@ -784,9 +1069,10 @@ bot.on("message", async (msg) => {
         return;
       }
 
+      // NOTE: /clear TIDAK ditampilkan di sini (sesuai request)
       await safeSend(
         chatId,
-        `✅ Bot aktif.\n👤 Staff: ${code}\n\nREQUEST (per DB, 1 DB = ${DB_SIZE} nomor):\n#vcardfresh JUMLAH_DB\n#vcardfu JUMLAH_DB\n\nNomor jagaan: ambil dari ${SHEET_NAME}!G1 (disisipkan tiap DB)\n\nLaporan:\n/report\n/reportdate YYYY-MM-DD\n/reportmonth BULAN TAHUN\n/reportstaff\n/reportstaffdate YYYY-MM-DD\n/reportstaffmonth BULAN TAHUN\n/lastrequest\n/stafflist\n/setstaff KODE (ganti)\n/reset (opsional)\n\nContoh:\n#vcardfu 5`
+        `✅ Bot aktif.\n👤 Staff: ${code}\n\nREQUEST (per DB, 1 DB = ${DB_SIZE} nomor):\n#vcardfresh JUMLAH_DB\n#vcardfu JUMLAH_DB\n\nNomor jagaan: ${SHEET_NAME}!G1:G10 (max 10, dipakai berurut)\nNama DB & Contact: ${SHEET_NAME}!I1:I4\n\nLaporan:\n/report\n/reportdate YYYY-MM-DD\n/reportmonth BULAN TAHUN\n/reportstaff\n/reportstaffdate YYYY-MM-DD\n/reportstaffmonth BULAN TAHUN\n/lastrequest\n/stafflist\n/setstaff KODE (ganti)\n/reset (opsional)\n\nContoh:\n#vcardfu 5`
       );
     } catch (e) {
       console.error("❌ /start error:", e);
@@ -795,6 +1081,7 @@ bot.on("message", async (msg) => {
     return;
   }
 
+  // ===== /setstaff =====
   const setm = text.match(/^\/setstaff\s+(.+)$/i);
   if (setm) {
     const code = normalizeStaffCode(setm[1]);
@@ -810,6 +1097,7 @@ bot.on("message", async (msg) => {
     return;
   }
 
+  // ===== /stafflist =====
   if (text === "/stafflist") {
     try {
       const rows = await listStaffUsers(50);
@@ -828,6 +1116,7 @@ bot.on("message", async (msg) => {
     return;
   }
 
+  // ===== /report =====
   if (text === "/report") {
     try {
       const rep = await getReportToday();
@@ -843,6 +1132,7 @@ bot.on("message", async (msg) => {
     return;
   }
 
+  // ===== /reportdate =====
   const rd = text.match(/^\/reportdate\s+(\d{4}-\d{2}-\d{2})$/i);
   if (rd) {
     const dateStr = rd[1];
@@ -863,6 +1153,7 @@ bot.on("message", async (msg) => {
     return;
   }
 
+  // ===== /reportmonth =====
   const rm = text.match(/^\/reportmonth\s+(\d{1,2})\s+(\d{4})$/i);
   if (rm) {
     const month = parseInt(rm[1], 10);
@@ -884,11 +1175,12 @@ bot.on("message", async (msg) => {
     return;
   }
 
+  // ===== /reportstaff =====
   if (text === "/reportstaff") {
     try {
       const dateStr = todayKeyWIB();
       const rows = await getStaffReportByDate(dateStr);
-      await safeSend(chatId, renderStaffTable(`📋 REPORT STAFF (${dateStr})`, rows));
+      await safeSend(chatId, renderStaffList(`📋 REPORT STAFF (${dateStr})`, rows));
     } catch (e) {
       console.error("❌ /reportstaff ERROR:", e);
       await safeSend(chatId, "❌ Gagal ambil report staff.");
@@ -896,12 +1188,13 @@ bot.on("message", async (msg) => {
     return;
   }
 
+  // ===== /reportstaffdate =====
   const rsd = text.match(/^\/reportstaffdate\s+(\d{4}-\d{2}-\d{2})$/i);
   if (rsd) {
     const dateStr = rsd[1];
     try {
       const rows = await getStaffReportByDate(dateStr);
-      await safeSend(chatId, renderStaffTable(`📋 REPORT STAFF (${dateStr})`, rows));
+      await safeSend(chatId, renderStaffList(`📋 REPORT STAFF (${dateStr})`, rows));
     } catch (e) {
       console.error("❌ /reportstaffdate ERROR:", e);
       await safeSend(chatId, "❌ Gagal ambil report staff tanggal.");
@@ -909,6 +1202,7 @@ bot.on("message", async (msg) => {
     return;
   }
 
+  // ===== /reportstaffmonth =====
   const rsm = text.match(/^\/reportstaffmonth\s+(\d{1,2})\s+(\d{4})$/i);
   if (rsm) {
     const month = parseInt(rsm[1], 10);
@@ -919,10 +1213,7 @@ bot.on("message", async (msg) => {
     }
     try {
       const rep = await getStaffReportByMonth(month, year);
-      await safeSend(
-        chatId,
-        renderStaffTable(`📋 REPORT STAFF BULAN ${rep.year}-${rep.month}`, rep.rows)
-      );
+      await safeSend(chatId, renderStaffList(`📋 REPORT STAFF BULAN ${rep.year}-${rep.month}`, rep.rows));
     } catch (e) {
       console.error("❌ /reportstaffmonth ERROR:", e);
       await safeSend(chatId, "❌ Gagal ambil report staff bulanan.");
@@ -930,18 +1221,11 @@ bot.on("message", async (msg) => {
     return;
   }
 
+  // ===== /lastrequest =====
   if (text === "/lastrequest") {
     try {
       const rows = await getLastRequests(30);
-      if (!rows.length) {
-        await safeSend(chatId, "📌 LAST REQUEST\nBelum ada data.");
-        return;
-      }
-      const lines = rows.map(
-        (r, i) =>
-          `${i + 1}. ${r.staffCode} (ID:${r.userId}) — ${r.type} ${r.dbCount} DB — ${r.lastAt}`
-      );
-      await safeSend(chatId, "📌 LAST REQUEST (terbaru)\n" + lines.join("\n"));
+      await safeSend(chatId, renderLastReqList(rows));
     } catch (e) {
       console.error("❌ /lastrequest ERROR:", e);
       await safeSend(chatId, "❌ Gagal ambil last request.");
@@ -949,6 +1233,7 @@ bot.on("message", async (msg) => {
     return;
   }
 
+  // ===== /reset =====
   if (text === "/reset") {
     try {
       const rep = await resetReportToday();
@@ -960,7 +1245,7 @@ bot.on("message", async (msg) => {
     return;
   }
 
-  // REQUEST (per DB)
+  // ===== REQUEST (per DB) =====
   const m = text.match(/^#(vcardfresh|vcardfu)\s+(\d+)$/i);
   if (!m) return;
 
@@ -984,4 +1269,4 @@ bot.on("message", async (msg) => {
   processQueue();
 });
 
-console.log("🤖 BOT FINAL — DB GDS + STAFF REPORT (LIST) + STAFF CODE + PER DB");
+console.log("🤖 BOT FINAL — DB GDS + Guard G1:G10 (berurut) + Nama DB/Contact (I1:I4) + /clear PIN (K1) + /lastrequest rapih");
